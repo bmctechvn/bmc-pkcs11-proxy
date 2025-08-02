@@ -26,7 +26,6 @@
 #include "gck-rpc-layer.h"
 #include "gck-rpc-private.h"
 #include "gck-rpc-tls-psk.h"
-
 #include "pkcs11/pkcs11.h"
 
 #include <sys/types.h>
@@ -1280,6 +1279,51 @@ proto_read_sesssion_info(GckRpcMessage * msg, CK_SESSION_INFO_PTR info)
 	if (_ret == CKR_OK) \
 		_ret = proto_read_mechanism_info (_cs->resp, info);
 
+#define PKCS11_PROXY_SOCKET "tls://127.0.0.1:12345"
+#define PKCS11_PROXY_TLS_PSK_FILE "./config/psk.txt"
+#define FILE_CONF	"./config/client.conf"
+// Trả về 0 nếu thành công, -1 nếu thất bại
+static int read_config(const char *filename, char **socket_val, char **psk_file_val) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Không thể mở tệp cấu hình %s lấy cấu hình mặc định! \n", filename);		
+        return -1;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        // Bỏ qua dòng trống hoặc dòng ghi chú (#)
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
+            continue;
+        }
+
+        char key[64], value[192];
+        // Phân tích dòng theo định dạng "key = value"
+        if (sscanf(line, " %63[^= ] = %191[^\n]", key, value) == 2) {
+            // Loại bỏ khoảng trắng cuối dòng của value
+            char *end = value + strlen(value) - 1;
+            while (end > value && isspace((unsigned char)*end)) {
+                end--;
+            }
+            *(end + 1) = 0;
+
+            if (strcmp(key, "socket") == 0) {
+                *socket_val = strdup(value);
+            } else if (strcmp(key, "psk_file") == 0) {
+                *psk_file_val = strdup(value);
+            }
+        }
+    }
+
+    fclose(file);
+
+    if (!*socket_val || !*psk_file_val) {
+        fprintf(stderr, "Lỗi: Thiếu 'socket' hoặc 'psk_file' trong tệp cấu hình.\n");
+        return -1;
+    }
+
+    return 0;
+}
 /* -------------------------------------------------------------------
  * INITIALIZATION and 'GLOBAL' CALLS
  */
@@ -1293,7 +1337,16 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 	pid_t pid;
 
 	debug(("C_Initialize: enter"));
-
+	// Cấu trúc để lưu trữ cấu hình client
+	struct client_config {
+		char *socket_path;
+		char *psk_file;
+	};
+	struct client_config config;
+	if(read_config(FILE_CONF, &config.socket_path, &config.psk_file)){
+		config.socket_path = strdup(PKCS11_PROXY_SOCKET);
+		config.psk_file = strdup(PKCS11_PROXY_TLS_PSK_FILE);
+	}
 #ifdef _DEBUG
 	GCK_RPC_CHECK_CALLS();
 #endif
@@ -1352,7 +1405,7 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 
 	/* Lookup the socket path, append '.pkcs11' if it is a domain socket. */
 	if (pkcs11_socket_path[0] == 0) {
-		path = getenv("PKCS11_PROXY_SOCKET");
+		path = config.socket_path;
 		if (path && path[0]) {
 			if ((! strncmp("tcp://", path, 6)) ||
 			    (! strncmp("tls://", path, 6)))
@@ -1373,7 +1426,8 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 	/* If socket path indicates TLS, make sure tls_psk_key_filename is populated. */
 	if (! strncmp("tls://", pkcs11_socket_path, 6)) {
 		if (! tls_psk_key_filename[0]) {
-			path = getenv("PKCS11_PROXY_TLS_PSK_FILE");
+			path = config.psk_file;
+			if (path);
 			if (path && path[0]) {
 				snprintf(tls_psk_key_filename, sizeof(tls_psk_key_filename),
 					 "%s", path);

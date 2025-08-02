@@ -22,7 +22,6 @@
 */
 
 #include "config.h"
-
 #include "pkcs11/pkcs11.h"
 
 #include "gck-rpc-layer.h"
@@ -44,8 +43,11 @@
 # include <winsock2.h>
 #endif
 
-#define SOCKET_PATH "tcp://127.0.0.1"
-
+// Cấu hình mặc định!
+#define SOCKET_PATH "tls://127.0.0.1:12345"
+#define PSK_FILE "/etc/bmc-hsm/psk.txt"
+#define PKCS11_MODULE "/usr/lib/opensc-pkcs11.so"
+#define FILE_CONF "./config/daemon.conf"
 #ifdef SECCOMP
 #include <seccomp.h>
 //#include "seccomp-bpf.h"
@@ -55,7 +57,58 @@
 #include <fcntl.h> /* for seccomp init */
 #endif /* SECCOMP */
 
+// Cấu trúc để lưu trữ cấu hình
+static struct daemon_config {
+    char *socket_path;
+    char *psk_file;
+	char *pkcs11_module;
+};
+// Hàm đọc tệp cấu hình
+// Trả về 0 nếu thành công, -1 nếu thất bại
+static int read_config(const char *filename, char **socket_val, char **psk_file_val, char **pkcs11_module_val) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Không thể mở tệp cấu hình %s, sẽ lấy cấu hình mặc định! \n", filename);
+        return -1;
+    }
 
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        // Bỏ qua dòng trống hoặc dòng ghi chú (#)
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
+            continue;
+        }
+
+        char key[64], value[192];
+        // Phân tích dòng theo định dạng "key = value"
+        if (sscanf(line, " %63[^= ] = %191[^\n]", key, value) == 2) {
+            // Loại bỏ khoảng trắng cuối dòng của value
+            char *end = value + strlen(value) - 1;
+            while (end > value && isspace((unsigned char)*end)) {
+                end--;
+            }
+            *(end + 1) = 0;
+
+            if (strcmp(key, "socket") == 0) {
+                *socket_val = strdup(value);
+            } else if (strcmp(key, "psk_file") == 0) {
+                *psk_file_val = strdup(value);
+            }
+			else if (strcmp(key, "pkcs11_module") == 0) {
+                *pkcs11_module_val = strdup(value);
+            }        
+        }
+    }
+
+    fclose(file);
+
+    if (!*socket_val || !*psk_file_val) {
+        fprintf(stderr, "Lỗi: Thiếu 'socket' hoặc 'psk_file' trong tệp cấu hình.\n");
+        return -1;
+    }
+
+    return 0;
+}
 static int install_syscall_filter(const int sock, const char *tls_psk_keyfile, const char *path)
 {
 #ifdef SECCOMP
@@ -188,12 +241,6 @@ static CK_C_INITIALIZE_ARGS p11_init_args = {
 
 static int is_running = 1;
 
-static int usage(void)
-{
-	fprintf(stderr, "usage: pkcs11-daemon pkcs11-module [<socket>|\"-\"]\n\tUsing \"-\" results in a single-thread inetd-type daemon\n");
-	exit(2);
-}
-
 void termination_handler (int signum)
 {
 	is_running = 0;
@@ -216,17 +263,20 @@ int main(int argc, char *argv[])
 	CK_RV rv;
 	CK_C_INITIALIZE_ARGS init_args;
 	GckRpcTlsPskState *tls;
-
-	/* The module to load is the argument */
-	if (argc != 2 && argc != 3)
-		usage();
-
-        openlog("pkcs11-proxy",LOG_CONS|LOG_PID,LOG_DAEMON);
-
+	/* for config file*/
+	struct daemon_config config = {0};
+    const char *config_file = FILE_CONF; // Đường dẫn mặc định
+	// Tải cấu hình từ tệp
+    if (read_config(config_file, &config.socket_path, &config.psk_file, &config.pkcs11_module) != 0) {
+		// Nếu không được thì lấy giá trị mặc định!
+        config.socket_path = SOCKET_PATH;
+        config.psk_file = PSK_FILE; 
+		config.pkcs11_module = PKCS11_MODULE;
+    }	
 	/* Load the library */
-	module = dlopen(argv[1], RTLD_NOW);
+	module = dlopen(config.pkcs11_module, RTLD_NOW);
 	if (!module) {
-		fprintf(stderr, "couldn't open library: %s: %s\n", argv[1],
+		fprintf(stderr, "couldn't open library: %s: %s\n", config.pkcs11_module,
 			dlerror());
 		exit(1);
 	}
@@ -237,7 +287,7 @@ int main(int argc, char *argv[])
 	if (!func_get_list) {
 		fprintf(stderr,
 			"couldn't find C_GetFunctionList in library: %s: %s\n",
-			argv[1], dlerror());
+			config.pkcs11_module, dlerror());
 		exit(1);
 	}
 
@@ -247,7 +297,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr,
 			"couldn't get function list from C_GetFunctionList"
 			"in libary: %s: 0x%08x\n",
-			argv[1], (int)rv);
+			config.pkcs11_module, (int)rv);
 		exit(1);
 	}
 
@@ -258,32 +308,27 @@ int main(int argc, char *argv[])
 	rv = (funcs->C_Initialize) (&init_args);
 	if (rv != CKR_OK) {
 		fprintf(stderr, "couldn't initialize module: %s: 0x%08x\n",
-			argv[1], (int)rv);
+			config.pkcs11_module, (int)rv);
 		exit(1);
 	}
 
-	path = getenv("PKCS11_DAEMON_SOCKET");
-	if (!path && argc == 3)
-           path = argv[2];
-        if (!path)
-	   path = SOCKET_PATH;
-
+	//path = getenv("PKCS11_DAEMON_SOCKET");
+	path = config.socket_path;	
 	/* Initialize TLS, if appropriate */
 	tls = NULL;
 	tls_psk_keyfile = NULL;
 	if (! strncmp("tls://", path, 6)) {
-		tls_psk_keyfile = getenv("PKCS11_PROXY_TLS_PSK_FILE");
+		//tls_psk_keyfile = getenv("PKCS11_PROXY_TLS_PSK_FILE");
+		tls_psk_keyfile = config.psk_file;
 		if (! tls_psk_keyfile || ! tls_psk_keyfile[0]) {
 			fprintf(stderr, "key file must be specified for tls:// socket.\n");
 			exit(1);
 		}
-
 		tls = calloc(1, sizeof(GckRpcTlsPskState));
 		if (tls == NULL) {
 			fprintf(stderr, "can't allocate memory for TLS-PSK");
 			exit(1);
 		}
-
 		if (! gck_rpc_init_tls_psk(tls, tls_psk_keyfile, NULL, GCK_RPC_TLS_PSK_SERVER)) {
 			fprintf(stderr, "TLS-PSK initialization failed");
 			exit(1);
@@ -344,7 +389,7 @@ int main(int argc, char *argv[])
 	rv = (funcs->C_Finalize) (NULL);
 	if (rv != CKR_OK)
 		fprintf(stderr, "couldn't finalize module: %s: 0x%08x\n",
-			argv[1], (int)rv);
+			config.pkcs11_module, (int)rv);
 
 	dlclose(module);
 
